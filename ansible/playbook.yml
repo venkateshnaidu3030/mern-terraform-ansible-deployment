@@ -1,0 +1,199 @@
+---
+- name: Step 1 - Configure MongoDB Database Server (Private Subnet)
+  hosts: db
+  become: true
+  tasks:
+    - name: Update apt cache and install prerequisites
+      apt:
+        name:
+          - gnupg
+          - curl
+          - ufw
+        state: present
+        update_cache: yes
+
+    - name: Add MongoDB 7.0 GPG key
+      shell: |
+        curl -fsSL https://www.mongodb.org/static/pgp/server-7.0.asc | gpg --dearmor -o /usr/share/keyrings/mongodb-server-7.0.gpg --yes
+      args:
+        creates: /usr/share/keyrings/mongodb-server-7.0.gpg
+
+    - name: Add MongoDB APT repository
+      copy:
+        dest: /etc/apt/sources.list.d/mongodb-org-7.0.list
+        content: "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-7.0.gpg ] https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/7.0 multiverse\n"
+
+    - name: Install MongoDB packages
+      apt:
+        name: mongodb-org
+        state: present
+        update_cache: yes
+
+    - name: Bind MongoDB to all interfaces
+      lineinfile:
+        path: /etc/mongod.conf
+        regexp: "^ *bindIp:"
+        line: "  bindIp: 0.0.0.0"
+
+    - name: Start and enable MongoDB
+      systemd:
+        name: mongod
+        state: restarted
+        enabled: yes
+
+    - name: Pause 5 seconds for initialization
+      pause:
+        seconds: 5
+
+    - name: Create MongoDB administrator user
+      shell: |
+        mongosh admin --eval '
+          if (!db.getUser("admin")) {
+            db.createUser({
+              user: "admin",
+              pwd: "SuperSecret2026Password",
+              roles: [ { role: "userAdminAnyDatabase", db: "admin" }, { role: "readWriteAnyDatabase", db: "admin" } ]
+            });
+          }
+        '
+
+    - name: Enable authentication in mongod.conf
+      blockinfile:
+        path: /etc/mongod.conf
+        block: |
+          security:
+            authorization: enabled
+
+    - name: Restart MongoDB to enforce authentication
+      systemd:
+        name: mongod
+        state: restarted
+
+    - name: Configure UFW for DB Server
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "22"
+        - "27017"
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+- name: Step 2 - Configure Web Server (Frontend & Backend)
+  hosts: web
+  become: true
+  tasks:
+    - name: Update apt cache and install packages
+      apt:
+        name:
+          - git
+          - curl
+          - nginx
+          - ufw
+        state: present
+        update_cache: yes
+
+    - name: Setup Node.js 18 repository
+      shell: curl -fsSL https://deb.nodesource.com/setup_18.x | bash -
+      args:
+        creates: /etc/apt/sources.list.d/nodesource.list
+
+    - name: Install Node.js
+      apt:
+        name: nodejs
+        state: present
+
+    - name: Install PM2 process manager
+      npm:
+        name: pm2
+        global: yes
+        state: present
+
+    - name: Clone TravelMemory repository
+      git:
+        repo: "https://github.com/UnpredictablePrashant/TravelMemory.git"
+        dest: /var/www/TravelMemory
+        force: yes
+
+    - name: Update folder ownership
+      file:
+        path: /var/www/TravelMemory
+        owner: ubuntu
+        group: ubuntu
+        recurse: yes
+
+    # --- Backend ---
+    - name: Install Backend Dependencies
+      npm:
+        path: /var/www/TravelMemory/backend
+
+    - name: Configure Backend .env file
+      template:
+        src: travelmemory.env.j2
+        dest: /var/www/TravelMemory/backend/.env
+        owner: ubuntu
+        group: ubuntu
+
+    - name: Start backend service with PM2
+      become_user: ubuntu
+      shell: |
+        pm2 describe travelmemory-backend > /dev/null && pm2 restart travelmemory-backend || pm2 start index.js --name travelmemory-backend
+      args:
+        chdir: /var/www/TravelMemory/backend
+
+    # --- Frontend ---
+    - name: Configure Frontend API URL
+      lineinfile:
+        path: /var/www/TravelMemory/frontend/src/url.js
+        regexp: "^export const baseUrl =.*"
+        line: 'export const baseUrl = "http://3.107.57.14:5000";'
+
+    - name: Install Frontend Dependencies
+      npm:
+        path: /var/www/TravelMemory/frontend
+
+    - name: Build React Frontend
+      shell: npm run build
+      args:
+        chdir: /var/www/TravelMemory/frontend
+
+    # --- Nginx Proxy ---
+    - name: Configure Nginx site
+      copy:
+        dest: /etc/nginx/sites-available/default
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              root /var/www/TravelMemory/frontend/build;
+              index index.html index.htm;
+              server_name _;
+
+              location / {
+                  try_files $uri $uri/ /index.html;
+              }
+          }
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+        enabled: yes
+
+    # --- Hardening ---
+    - name: Configure UFW for Web Server
+      ufw:
+        rule: allow
+        port: "{{ item }}"
+        proto: tcp
+      loop:
+        - "22"
+        - "80"
+        - "5000"
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
